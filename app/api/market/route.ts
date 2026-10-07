@@ -1,5 +1,65 @@
 import {NextResponse} from 'next/server';
 export const dynamic='force-dynamic';
-const SOURCE='https://www.donutstats.net/auction';
-function value(s:string){const x=s.replace(/[$,]/g,''),m=/K$/i.test(x)?1e3:/M$/i.test(x)?1e6:/B$/i.test(x)?1e9:1;return (parseFloat(x)||0)*m}
-export async function GET(){try{const r=await fetch(SOURCE,{headers:{'User-Agent':'Mozilla/5.0 DonutFlipFinder'},cache:'no-store'});if(!r.ok)throw Error('Public market unavailable');const html=await r.text();const text=html.replace(/<[^>]+>/g,' ').replace(/&amp;/g,'&').replace(/\s+/g,' ');const re=/Image:\s*([A-Za-z0-9 '.-]{2,50}).{0,350}?\$([\d,.]+(?:\.\d+)?[KMB]?)/gi;const groups=new Map<string,number[]>();let m;while((m=re.exec(text))!==null){const name=m[1].trim(),p=value(m[2]);if(p)groups.set(name,[...(groups.get(name)||[]),p])}const rows=[...groups].map(([name,p])=>{p.sort((a,b)=>a-b);const buy=p[0],c=p.slice(1,6),mid=c.length?c[Math.floor(c.length/2)]:buy,sell=mid*.95,profit=sell-buy,roi=buy?profit/buy*100:0,depth=p.length,confidence=depth>=5?'High':depth>=3?'Medium':'Low',score=Math.min(100,Math.round(Math.min(60,roi*2)+Math.min(40,depth*6)));return{name,buy,sell,profit,roi,depth,confidence,score}}).filter(x=>x.profit>0&&x.roi>=2).sort((a,b)=>b.score-a.score||b.profit-a.profit);return NextResponse.json({rows,updatedAt:new Date().toISOString(),source:SOURCE})}catch(e:any){return NextResponse.json({rows:[],error:e.message,updatedAt:new Date().toISOString()})}}
+export const revalidate=0;
+
+type Obs={name:string;price:number;source:string;freshness:number};
+const SOURCES=[
+ {name:'DonutStats Live AH',url:'https://www.donutstats.net/auction',freshness:1},
+ {name:'DonutSMP Stats',url:'https://donutsmpstats.org/items',freshness:.82},
+ {name:'donut.build',url:'https://www.donut.build/auction',freshness:.65},
+];
+
+function num(raw:string){
+ const s=raw.replace(/[$,\s]/g,'').toUpperCase();
+ const mult=s.endsWith('K')?1e3:s.endsWith('M')?1e6:s.endsWith('B')?1e9:1;
+ return (parseFloat(s)||0)*mult;
+}
+function clean(s:string){return s.replace(/Image:?/gi,'').replace(/\s+/g,' ').trim()}
+function key(s:string){return clean(s).toLowerCase().replace(/[^a-z0-9]+/g,' ').trim()}
+function median(a:number[]){const x=[...a].sort((a,b)=>a-b);return x.length?x[Math.floor(x.length/2)]:0}
+function parse(source:string,html:string,freshness:number):Obs[]{
+ const text=html.replace(/<script[\s\S]*?<\/script>/gi,' ').replace(/<style[\s\S]*?<\/style>/gi,' ').replace(/<[^>]+>/g,' ').replace(/&amp;/g,'&').replace(/&#x27;/g,"'").replace(/&nbsp;/g,' ').replace(/\s+/g,' ');
+ const out:Obs[]=[];
+ const patterns=[
+   /Image:?\s*([A-Za-z0-9 '.-]{2,45})\s+(?:by\s+[A-Za-z0-9_.-]+\s+)?\$([\d,.]+(?:\.\d+)?[KMB]?)/gi,
+   /([A-Z][A-Za-z0-9 '.-]{2,45})\s+\$([\d,.]+(?:\.\d+)?[KMB]?)/g
+ ];
+ for(const re of patterns){let m;while((m=re.exec(text))!==null){const name=clean(m[1]),price=num(m[2]);if(price>0&&name.length<46&&!/current|min|max|average|price|change|search|sort/i.test(name))out.push({name,price,source,freshness})}}
+ return out;
+}
+async function load(s:typeof SOURCES[number]){
+ try{
+  const c=new AbortController();const t=setTimeout(()=>c.abort(),7000);
+  const r=await fetch(s.url,{headers:{'User-Agent':'Mozilla/5.0 (compatible; DonutFlipFinder/2.1)'},cache:'no-store',signal:c.signal});
+  clearTimeout(t); if(!r.ok) throw Error(String(r.status));
+  return {name:s.name,url:s.url,ok:true,obs:parse(s.name,await r.text(),s.freshness)};
+ }catch(e:any){return {name:s.name,url:s.url,ok:false,error:e?.message||'unavailable',obs:[] as Obs[]}}
+}
+export async function GET(){
+ const loaded=await Promise.all(SOURCES.map(load));
+ const by=new Map<string,Obs[]>();
+ for(const src of loaded)for(const o of src.obs){const k=key(o.name);if(k)by.set(k,[...(by.get(k)||[]),o])}
+ const rows=[...by.entries()].map(([k,obs])=>{
+   const bySource=new Map<string,Obs[]>();for(const o of obs)bySource.set(o.source,[...(bySource.get(o.source)||[]),o]);
+   const sourceMedians=[...bySource.entries()].map(([source,a])=>({source,price:median(a.map(x=>x.price)),freshness:Math.max(...a.map(x=>x.freshness)),listings:a.length}));
+   const all=obs.map(x=>x.price).sort((a,b)=>a-b); if(all.length<2)return null;
+   const center=median(sourceMedians.map(x=>x.price));
+   const filtered=obs.filter(x=>center<=0||x.price>=center*.2&&x.price<=center*5).sort((a,b)=>a.price-b.price);
+   if(filtered.length<2)return null;
+   const buy=filtered[0].price;
+   const comps=filtered.filter(x=>x.price>buy).slice(0,8).map(x=>x.price);
+   if(!comps.length)return null;
+   const market=median(comps),sell=market*.95,profit=sell-buy,roi=buy?profit/buy*100:0;
+   const sources=new Set(filtered.map(x=>x.source)).size,depth=filtered.length;
+   const agreement=sourceMedians.length>1?Math.max(0,1-(Math.max(...sourceMedians.map(x=>x.price))-Math.min(...sourceMedians.map(x=>x.price)))/Math.max(center,1)):0;
+   const confidence=sources>=3&&agreement>.6?'High':sources>=2?'Medium':'Low';
+   const score=Math.min(100,Math.round(Math.min(50,Math.max(0,roi)*1.5)+Math.min(25,depth*3)+sources*7+agreement*4));
+   const display=filtered.sort((a,b)=>b.freshness-a.freshness)[0].name;
+   return {name:display,buy,sell,profit,roi,depth,confidence,score,sources,sourceNames:[...new Set(filtered.map(x=>x.source))]};
+ }).filter((x):x is NonNullable<typeof x>=>!!x&&x.profit>0&&x.roi>=2).sort((a,b)=>b.score-a.score||b.profit-a.profit).slice(0,150);
+ return NextResponse.json({
+   rows,updatedAt:new Date().toISOString(),mode:'multi-source',
+   sources:loaded.map(x=>({name:x.name,url:x.url,ok:x.ok,observations:x.obs.length,error:'error'in x?x.error:undefined})),
+   methodology:'Lowest observed listing is buy; exit is 95% of median nearby comparable observations. Extreme cross-source outliers are removed. Verify in-game before buying.'
+ },{headers:{'Cache-Control':'no-store, max-age=0'}});
+}
